@@ -77,10 +77,10 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 4) (Optional) Add OpenAI API key
-Create a file named `.env` in the project root and add
+### 4) OpenAI API key
+Create a file named `.env` in project root and add
 ```
-OPENAI_API_KEY=insert_api_key_here
+OPENAI_API_KEY=[key]
 ```
 
 ### 5) Run the app
