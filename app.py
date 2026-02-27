@@ -1,3 +1,16 @@
+from forecast import (
+    make_features,
+    time_split,
+    train_mean_models,
+    train_quantile_models,
+    evaluate_mean_model,
+    choose_best_by_val,
+    approx_dist_from_quantiles,
+)
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+
 import os
 import json
 import numpy as np
@@ -409,6 +422,12 @@ st.sidebar.header("Simulation")
 n_sims = st.sidebar.slider("Simulations", 1000, 20000, 8000, 1000)
 level = st.sidebar.slider("VaR confidence", 0.80, 0.99, 0.95, 0.01)
 
+st.sidebar.header("Stock Forecast")
+lookback = st.sidebar.slider("Feature lookback (days)", 5, 60, 20, 5)
+train_frac = st.sidebar.slider("Train fraction", 0.50, 0.85, 0.70, 0.05)
+val_frac = st.sidebar.slider("Val fraction", 0.05, 0.30, 0.15, 0.05)
+use_quantiles = st.sidebar.checkbox("Predict quantiles (VaR)", value=True)
+
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 weights = np.array([float(x.strip()) for x in weights_input.split(",") if x.strip()], dtype=float)
 
@@ -460,8 +479,8 @@ for k in list(st.session_state.scenario_shift.keys()):
 
 
 # -TABS
-tab_overview, tab_scenario, tab_results, tab_model, tab_data, tab_explain = st.tabs(
-    ["Overview", "Scenario", "Results", "Exposures", "Data", "Explain"]
+tab_overview, tab_scenario, tab_results, tab_model, tab_data, tab_forecast, tab_explain = st.tabs(
+    ["Overview", "Scenario", "Results", "Exposures", "Data", "Forecast", "Explain"]
 )
 
 with tab_overview:
@@ -578,6 +597,80 @@ with tab_results:
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
     st.pyplot(fig, clear_figure=True, width="content")
+
+
+
+with tab_forecast:
+    st.subheader("Forecast: next-day return")
+    st.caption("Train models on rolling factor features to predict the portfolio's next-day return.")
+
+    X, y = make_features(factor_rets, port_ret, lookback=lookback)
+    #just in case
+    if len(X) < 200:
+        st.warning("Not enough data after feature building, try again with an earlier start date or fewer windows.")
+    else:
+        (X_train, y_train), (X_val, y_val), (X_test, y_test) = time_split(
+            X, y, train_frac=train_frac, val_frac=val_frac
+        )
+        models = train_mean_models(X_train, y_train, random_state=0)
+
+        rows = []
+        for name, m in models.items():
+            val_metrics = evaluate_mean_model(m, X_val, y_val)
+            test_metrics = evaluate_mean_model(m, X_test, y_test)
+            rows.append({
+                "model": name,
+                "val_MAE": val_metrics["MAE"],
+                "val_RMSE": val_metrics["RMSE"],
+                "test_MAE": test_metrics["MAE"],
+                "test_RMSE": test_metrics["RMSE"],
+                "test_direction_acc": test_metrics["DirectionAcc"],
+            })
+
+        st.dataframe(pd.DataFrame(rows).set_index("model"))
+
+        #picking best by validation RMSE
+        best_name, best_model, best_val_rmse = choose_best_by_val(models, X_val, y_val)
+        st.caption(f"Using **{best_name}** (lowest val RMSE = {best_val_rmse:.6f}) for live forecast.")
+
+        #live prediction (next day) w/ most recent feature row
+        x_last = X.iloc[[-1]]
+        mean_pred = float(best_model.predict(x_last)[0])
+
+        c1, c2 = st.columns(2)
+        c1.metric("Predicted next-day mean return", f"{mean_pred*100:.2f}%")
+        c2.metric("Last observed portfolio return", f"{float(port_ret.iloc[-1])*100:.2f}%")
+
+        #quantile prediction for VaR bounds
+        if use_quantiles:
+            q_models = train_quantile_models(X_train, y_train, qs=(0.05, 0.50, 0.95))
+            q05 = float(q_models["Q5"].predict(x_last)[0])
+            q50 = float(q_models["Q50"].predict(x_last)[0])
+            q95 = float(q_models["Q95"].predict(x_last)[0])
+
+            q1, q2, q3 = st.columns(3)
+            q1.metric("Q5 (downside)", f"{q05*100:.2f}%")
+            q2.metric("Q50 (median)", f"{q50*100:.2f}%")
+            q3.metric("Q95 (upside)", f"{q95*100:.2f}%")
+
+            # Make an approximate distribution and reuse your VaR/CVaR code
+            sims_ml = approx_dist_from_quantiles(q05, q50, q95, n=n_sims, seed=0)
+            v_ml, c_ml = var_cvar(sims_ml, level=level)
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric(f"Implied VaR {int(level*100)}%", f"{v_ml*100:.2f}%")
+            d2.metric(f"Implied CVaR {int(level*100)}%", f"{c_ml*100:.2f}%")
+            d3.metric("P(return < -1%)", f"{np.mean(sims_ml < -0.01)*100:.1f}%")
+
+            fig, ax = plt.subplots(figsize=(6.6, 3.2), dpi=160)
+            ax.hist(sims_ml, bins=45)
+            ax.set_title("ML-implied next-day return distribution", pad=10)
+            ax.set_xlabel("Return")
+            ax.set_ylabel("Count")
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            fig.tight_layout()
+            st.pyplot(fig, clear_figure=True, width="content")
 
 with tab_explain:
     st.subheader("Explain (OpenAI)")
